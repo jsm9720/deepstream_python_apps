@@ -107,3 +107,5 @@ def main(args):
     tracker = Gst.ElementFactory.make("nvtracker", "tracker")
     if not tracker:
         sys.stderr.write(" Unable to create tracker \n")
+    
+    
