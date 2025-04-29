@@ -1,7 +1,7 @@
 import os
 import configparser
 import math
-from datetime import datetime
+from datetime import datetime, timezone
 import time
 import sys
 sys.path.append("../")
@@ -14,17 +14,20 @@ import gi
 gi.require_version('Gst', '1.0')
 from gi.repository import GLib, Gst
 
+from shapely.geometry import Point, Polygon
 import zmq
 
 
 # EVENT_CLASS = ["Bicycle", "Car", "Person", "RoadSign"] # Unit Test
-EVENT_CLASS = ["FIRE", "OTHER", "NO_HELMET", "OTHER"] # Integration Test
+EVENT_CLASS = ["FIRE", "OTHER", "NO_HELMET", "OTHER", "INVADE"] # Integration Test
 RECORD_START_THRESHOLD = 3
 RECORD_STOP_THRESHOLD = 3
 ZM_PORT = 5400
+zone_info = {0:Polygon([(1261.7794189453125, 229.26934814453125), (1261.7794189453125, 990.0), (1562.9775390625, 1080.0), (1562.0, 100.0)])}
 input_file_list = ["rtsp://admin:total!23@192.168.0.201:554", \
                    "rtsp://admin:total!23@192.168.0.202:554", \
-                   "rtsp://admin:total!23@192.168.0.205:554"]
+                   "rtsp://admin:total!23@192.168.0.205:554", \
+                   "rtsp://admin:total!23@192.168.0.206:554/trackID=1"]
 
 
 class PipelineContext:
@@ -55,7 +58,6 @@ def cb_newpad(decodebin, decoder_src_pad,data):
 
     print("gstname=",gstname)
     if(gstname.find("video")!=-1):
-        # print("features=",features)
         if features.contains("memory:NVMM"):
             bin_ghost_pad=source_bin.get_static_pad("src")
             if not bin_ghost_pad.set_target(decoder_src_pad):
@@ -163,7 +165,6 @@ def start_event_recording(ctx: PipelineContext, cam_idx, event_id, object_id):
         print(f"[WARN] cam{cam_idx} event{event_id} is already being recorded.")
         return
 
-    # filename = f"cam{cam_idx}_event{event_id}_%05d.mp4" # splitmuxsink
     filename = f"../../../../../backup/{cam_idx}_{object_id}.ts" # Unit Test
     # filename = f"/data/green-city/events/{cam_idx}_{object_id}.ts" # Integration Test
     
@@ -189,9 +190,9 @@ def start_event_recording(ctx: PipelineContext, cam_idx, event_id, object_id):
 
     ctx.zmq_socket.send_json({
         "objectId": str(object_id),
-        # "cameraId": str(object_id), # Integration Test
+        # "cameraId": str(cam_idx), # Integration Test
         "cameraId": '1', # Unit Test
-        "timestamp": datetime.now().isoformat(),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
         "action": "START",
         "eventType": EVENT_CLASS[event_id],
     })
@@ -212,12 +213,46 @@ def stop_event_recording(ctx: PipelineContext, cam_idx, event_id, object_id):
 
     ctx.zmq_socket.send_json({
         "objectId": str(object_id),
-        # "cameraId": str(cam_idx), Integration Test
+        # "cameraId": str(cam_idx), # Integration Test
         "cameraId": '1', # Unit Test
-        "timestamp": datetime.now().isoformat(),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
         "action": "END",
         "eventType": EVENT_CLASS[event_id],
     })
+
+
+def is_point_in_polygon(point, polygon):
+    """
+    point: (x, y)
+    polygon: [(x1, y1), (x2, y2), ..., (xn, yn)]  (꼭짓점 순서대로)
+    """
+    x, y = point
+    n = len(polygon)
+    inside = False
+
+    px1, py1 = polygon[0]
+    for i in range(1, n + 1):
+        px2, py2 = polygon[i % n]  # 다각형은 마지막 꼭짓점에서 첫 꼭짓점으로 닫힘
+        if y > min(py1, py2):
+            if y <= max(py1, py2):
+                if x <= max(px1, px2):
+                    if py1 != py2:
+                        xinters = (y - py1) * (px2 - px1) / (py2 - py1) + px1
+                    if px1 == px2 or x <= xinters:
+                        inside = not inside
+        px1, py1 = px2, py2
+
+    return inside
+
+
+def invasion(point, zone):
+    return zone.contains(point)
+
+
+def is_center_inside(inner, outer):
+    cx = (inner[0] + inner[2]) / 2
+    cy = (inner[1] + inner[3]) / 2
+    return outer[0] <= cx <= outer[2] and outer[1] <= cy <= outer[3]
 
 
 def conv_src_pad_buffer_probe(pad, info, ctx):
@@ -240,6 +275,9 @@ def conv_src_pad_buffer_probe(pad, info, ctx):
         cam_idx = frame_meta.source_id
         l_obj = frame_meta.obj_meta_list
 
+        person_bboxes = []
+        safe_hat_bboxes = []
+
         while l_obj:
             try:
                 obj_meta = pyds.NvDsObjectMeta.cast(l_obj.data)
@@ -249,7 +287,32 @@ def conv_src_pad_buffer_probe(pad, info, ctx):
             class_id = obj_meta.class_id
             object_id = obj_meta.object_id
 
-            if class_id in [0, 1, 2, 3, 4] and object_id != -1:
+            left = obj_meta.rect_params.left
+            top = obj_meta.rect_params.top
+            width = obj_meta.rect_params.width
+            height = obj_meta.rect_params.height
+            bbox = (left, top, left + width, top + height)
+
+            if class_id == 0: # safe_hat
+                safe_hat_bboxes.append(bbox)
+
+            if class_id in [1, 2, 3] and object_id != -1:
+                if class_id == 2:  # Person
+                    # Depending on the event type, consider saving the person bbox or not.
+                    person_bboxes.append((object_id, bbox))
+
+                    # if shapely is heavy, have to make algorithm
+                    zone = zone_info.get(cam_idx)
+                    if zone is not None:
+                        if invasion(Point(left + width/2, top + height), zone):
+                            class_id = 4
+                        else:
+                            try:
+                                l_obj = l_obj.next
+                            except StopIteration:
+                                break
+                            continue
+
                 key = (cam_idx, class_id, object_id)
                 seen_keys.add(key)
                 tracker = ctx.object_tracker[key]
@@ -268,13 +331,32 @@ def conv_src_pad_buffer_probe(pad, info, ctx):
                 l_obj = l_obj.next
             except StopIteration:
                 break
+        
+        # safe hat process
+        class_id = 2
+        for obj_id, person_bbox in person_bboxes:
+            for safe_hat_bbox in safe_hat_bboxes:
+                if not is_center_inside(safe_hat_bbox, person_bbox):
+                    key = (cam_idx, class_id, obj_id)
+                    seen_keys.add(key)
+                    tracker = ctx.object_tracker[key]
+
+                    if tracker["first_seen"] is None:
+                        tracker["first_seen"] = current_time
+                    tracker["last_seen"] = current_time
+
+                    if not tracker["is_recording"] and current_time - tracker["first_seen"] >= RECORD_START_THRESHOLD:
+                        start_event_recording(ctx, cam_idx, class_id, obj_id)
+                        tracker["is_recording"] = True
+                        tracker["event_id"] = class_id
+                        tracker["object_id"] = obj_id
 
         try:
             l_frame = l_frame.next
         except StopIteration:
             break
 
-    for key, tracker in list(ctx.object_tracker.items()): # 같은 카메라인경우만 보기 추가
+    for key, tracker in list(ctx.object_tracker.items()):
         if tracker["is_recording"]:
             cam_idx, class_id, object_id = key
             if key not in seen_keys:
@@ -282,7 +364,7 @@ def conv_src_pad_buffer_probe(pad, info, ctx):
                     stop_event_recording(ctx, cam_idx, class_id, object_id)
                     ctx.object_tracker.pop(key)
         else:
-            if tracker["last_seen"] and current_time - tracker["last_seen"] > 1.0:
+            if tracker["last_seen"] and current_time - tracker["last_seen"] > 1.5:
                 ctx.object_tracker.pop(key)
 
     return Gst.PadProbeReturn.OK
