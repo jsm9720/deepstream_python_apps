@@ -19,15 +19,15 @@ import zmq
 
 
 # EVENT_CLASS = ["Bicycle", "Car", "Person", "RoadSign"] # Unit Test
-EVENT_CLASS = ["FIRE", "OTHER", "NO_HELMET", "OTHER", "INVADE"] # Integration Test
+EVENT_CLASS = ["OTHER", "OTHER", "NO_HELMET", "OTHER", "INVADE"] # Integration Test
 RECORD_START_THRESHOLD = 3
 RECORD_STOP_THRESHOLD = 3
-ZM_PORT = 5400
+ZM_PORT = 15400
 zone_info = {0:Polygon([(1261.7794189453125, 229.26934814453125), (1261.7794189453125, 990.0), (1562.9775390625, 1080.0), (1562.0, 100.0)])}
-input_file_list = ["rtsp://admin:total!23@192.168.0.201:554", \
-                   "rtsp://admin:total!23@192.168.0.202:554", \
-                   "rtsp://admin:total!23@192.168.0.205:554", \
-                   "rtsp://admin:total!23@192.168.0.206:554/trackID=1"]
+input_file_list = [
+        "rtsp://admin:total!23@192.168.0.201:554",
+        "rtsp://admin:total!23@192.168.0.202:554",
+]
 
 
 class PipelineContext:
@@ -124,6 +124,51 @@ def ensure_tee_for_cam(ctx: PipelineContext, cam_idx):
     return tee
 
 
+def osd_sink_pad_buffer_probe(pad, info, user_data):
+    gst_buffer = info.get_buffer()
+    if not gst_buffer:
+        return Gst.PadProbeReturn.OK
+    
+    batch_meta = pyds.gst_buffer_get_nvds_batch_meta(hash(gst_buffer))
+    l_frame = batch_meta.frame_meta_list
+
+    while l_frame:
+        try:
+            frame_meta = pyds.NvDsFrameMeta.cast(l_frame.data)
+        except StopIteration:
+            break
+        
+        display_meta = pyds.nvds_acquire_display_meta_from_pool(batch_meta)
+
+        l_obj = frame_meta.obj_meta_list
+        while l_obj:
+            try:
+                obj_meta = pyds.NvDsObjectMeta.cast(l_obj.data)
+            except StopIteration:
+                break
+
+            class_id = obj_meta.class_id
+            object_id = obj_meta.object_id
+            
+            if not (class_id == user_data[0] and object_id == user_data[1]):
+                
+                obj_meta.rect_params.border_width = 0
+                obj_meta.text_params.display_text = ""
+                obj_meta.text_params.set_bg_clr = 0
+
+            try:
+                l_obj = l_obj.next
+            except StopIteration:
+                break
+
+        try:
+            l_frame = l_frame.next
+        except StopIteration:
+            break
+
+    return Gst.PadProbeReturn.OK
+
+
 def make_record_branch(ctx: PipelineContext, cam_idx, event_id, object_id, filename):
     record_bin = Gst.Bin.new(f"record-bin-{cam_idx}-{event_id}-{object_id}")
 
@@ -132,6 +177,7 @@ def make_record_branch(ctx: PipelineContext, cam_idx, event_id, object_id, filen
     nvosd = Gst.ElementFactory.make("nvdsosd", None)
     nvosd.set_property('process-mode', 1)
     nvosd.set_property('display-text', 1)
+    conv2 = Gst.ElementFactory.make("nvvideoconvert", None)
     capsfilter = Gst.ElementFactory.make("capsfilter", None)
     caps = Gst.Caps.from_string("video/x-raw(memory:NVMM), format=NV12")
     capsfilter.set_property("caps", caps)
@@ -142,20 +188,22 @@ def make_record_branch(ctx: PipelineContext, cam_idx, event_id, object_id, filen
     sink.set_property("location", filename)
     sink.set_property("sync", 0)
     
-    for elem in [queue, conv, nvosd, enc, parser, mux, sink]:
+    for elem in [queue, conv, nvosd, conv2, capsfilter, enc, parser, mux, sink]:
         record_bin.add(elem)
         elem.sync_state_with_parent()
+
+    queue.link(conv)
+    conv.link(nvosd)
+    nvosd.link(conv2)
+    conv2.link(capsfilter)
+    capsfilter.link(enc)
+    enc.link(parser)
+    parser.link(mux)
+    mux.link(sink)
 
     record_bin.add_pad(Gst.GhostPad.new("sink", queue.get_static_pad("sink")))
     ctx.pipeline.add(record_bin)
     record_bin.sync_state_with_parent()
-
-    queue.link(conv)
-    conv.link(nvosd)
-    nvosd.link(enc)
-    enc.link(parser)
-    parser.link(mux)
-    mux.link(sink)
 
     return record_bin
 
@@ -165,8 +213,8 @@ def start_event_recording(ctx: PipelineContext, cam_idx, event_id, object_id):
         print(f"[WARN] cam{cam_idx} event{event_id} is already being recorded.")
         return
 
-    filename = f"../../../../../backup/{cam_idx}_{object_id}.ts" # Unit Test
-    # filename = f"/data/green-city/events/{cam_idx}_{object_id}.ts" # Integration Test
+    # filename = f"../../../../../backup/{cam_idx}_{object_id}_{event_id}.ts" # Unit Test
+    filename = f"/data/green-city/events/1_{object_id}_{EVENT_CLASS[event_id]}.ts" # Integration Test
     
     tee = ensure_tee_for_cam(ctx, cam_idx)
     if not tee:
@@ -186,13 +234,14 @@ def start_event_recording(ctx: PipelineContext, cam_idx, event_id, object_id):
         "tee_src_pad": tee_src_pad,
     }
     # Gst.debug_bin_to_dot_file(ctx.pipeline, Gst.DebugGraphDetails.ALL, "my_pipeline") # visualization
-    print(f"[START] Recording cam{cam_idx} event{event_id} → {filename}")
+    cur_time = datetime.now(timezone.utc).isoformat()
+    print(f"[{cur_time}][START] Recording cam{cam_idx} event{event_id} → {filename}")
 
     ctx.zmq_socket.send_json({
         "objectId": str(object_id),
         # "cameraId": str(cam_idx), # Integration Test
         "cameraId": '1', # Unit Test
-        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "timestamp": cur_time,
         "action": "START",
         "eventType": EVENT_CLASS[event_id],
     })
@@ -203,19 +252,21 @@ def stop_event_recording(ctx: PipelineContext, cam_idx, event_id, object_id):
     if not rec:
         return
 
-    print(f"[STOP] Recording cam{cam_idx} event{event_id}")
     rec["elements"].set_state(Gst.State.NULL)
-    ctx.pipeline.remove(rec["elements"])
-
     rec["tee_src_pad"].unlink(rec["elements"].get_static_pad("sink"))
     tee = ctx.active_tees[cam_idx]
     tee.release_request_pad(rec["tee_src_pad"])
+    
+    ctx.pipeline.remove(rec["elements"])
+    
+    cur_time = datetime.now(timezone.utc).isoformat()
+    print(f"[{cur_time}][STOP] Recording cam{cam_idx} event{event_id}")
 
     ctx.zmq_socket.send_json({
         "objectId": str(object_id),
         # "cameraId": str(cam_idx), # Integration Test
         "cameraId": '1', # Unit Test
-        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "timestamp": cur_time,
         "action": "END",
         "eventType": EVENT_CLASS[event_id],
     })
@@ -292,11 +343,12 @@ def conv_src_pad_buffer_probe(pad, info, ctx):
             width = obj_meta.rect_params.width
             height = obj_meta.rect_params.height
             bbox = (left, top, left + width, top + height)
+            # print(cam_idx, class_id, object_id)
 
             if class_id == 0: # safe_hat
                 safe_hat_bboxes.append(bbox)
 
-            if class_id in [1, 2, 3] and object_id != -1:
+            if class_id in [0, 1, 2, 3] and object_id != -1:
                 if class_id == 2:  # Person
                     # Depending on the event type, consider saving the person bbox or not.
                     person_bboxes.append((object_id, bbox))
@@ -331,25 +383,41 @@ def conv_src_pad_buffer_probe(pad, info, ctx):
                 l_obj = l_obj.next
             except StopIteration:
                 break
-        
+        print(person_bboxes, safe_hat_bboxes)
         # safe hat process
         class_id = 2
-        for obj_id, person_bbox in person_bboxes:
-            for safe_hat_bbox in safe_hat_bboxes:
-                if not is_center_inside(safe_hat_bbox, person_bbox):
-                    key = (cam_idx, class_id, obj_id)
-                    seen_keys.add(key)
-                    tracker = ctx.object_tracker[key]
+        if len(safe_hat_bboxes) != 0:
+            for obj_id, person_bbox in person_bboxes:
+                for safe_hat_bbox in safe_hat_bboxes:
+                    if not is_center_inside(safe_hat_bbox, person_bbox):
+                        key = (cam_idx, class_id, obj_id)
+                        seen_keys.add(key)
+                        tracker = ctx.object_tracker[key]
 
-                    if tracker["first_seen"] is None:
-                        tracker["first_seen"] = current_time
-                    tracker["last_seen"] = current_time
+                        if tracker["first_seen"] is None:
+                            tracker["first_seen"] = current_time
+                        tracker["last_seen"] = current_time
 
-                    if not tracker["is_recording"] and current_time - tracker["first_seen"] >= RECORD_START_THRESHOLD:
-                        start_event_recording(ctx, cam_idx, class_id, obj_id)
-                        tracker["is_recording"] = True
-                        tracker["event_id"] = class_id
-                        tracker["object_id"] = obj_id
+                        if not tracker["is_recording"] and current_time - tracker["first_seen"] >= RECORD_START_THRESHOLD:
+                            start_event_recording(ctx, cam_idx, class_id, obj_id)
+                            tracker["is_recording"] = True
+                            tracker["event_id"] = class_id
+                            tracker["object_id"] = obj_id
+        else:
+            for obj_id, person_bbox in person_bboxes:
+                key = (cam_idx, class_id, obj_id)
+                seen_keys.add(key)
+                tracker = ctx.object_tracker[key]
+
+                if tracker["first_seen"] is None:
+                    tracker["first_seen"] = current_time
+                tracker["last_seen"] = current_time
+
+                if not tracker["is_recording"] and current_time - tracker["first_seen"] >= RECORD_START_THRESHOLD:
+                    start_event_recording(ctx, cam_idx, class_id, obj_id)
+                    tracker["is_recording"] = True
+                    tracker["event_id"] = class_id
+                    tracker["object_id"] = obj_id
 
         try:
             l_frame = l_frame.next
