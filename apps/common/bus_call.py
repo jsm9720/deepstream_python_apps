@@ -20,10 +20,11 @@ import sys
 gi.require_version('Gst', '1.0')
 from gi.repository import Gst
 
-def bus_call(bus, message, loop):
+def bus_call(bus, message, loop, ctx, handle_force_stop_fn):
     t = message.type
     if t == Gst.MessageType.EOS:
         sys.stdout.write("End-of-stream\n")
+        handle_force_stop_fn(ctx)
         loop.quit()
     elif t==Gst.MessageType.WARNING:
         err, debug = message.parse_warning()
@@ -31,5 +32,6 @@ def bus_call(bus, message, loop):
     elif t == Gst.MessageType.ERROR:
         err, debug = message.parse_error()
         sys.stderr.write("Error: %s: %s\n" % (err, debug))
+        handle_force_stop_fn(ctx)
         loop.quit()
     return True

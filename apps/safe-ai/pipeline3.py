@@ -1,7 +1,7 @@
 import os
 import configparser
 import math
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import time
 import sys
 sys.path.append("../")
@@ -16,28 +16,21 @@ from gi.repository import GLib, Gst
 
 from shapely.geometry import Point, Polygon
 import zmq
+import yaml
+import signal
 
 
 # EVENT_CLASS = ["Bicycle", "Car", "Person", "RoadSign"] # Unit Test
 EVENT_CLASS = ["OTHER", "OTHER", "NO_HELMET", "OTHER", "INVADE"] # Integration Test
 RECORD_START_THRESHOLD = 3
 RECORD_STOP_THRESHOLD = 3
-ZM_PORT = 15400
-FILE_OUTPUT = "/data/events/cache"
+ZM_PORT = 5400
+FILE_OUTPUT = "/data/cache"
 zone_info = {0:Polygon([(1261.7794189453125, 229.26934814453125), (1261.7794189453125, 990.0), (1562.9775390625, 1080.0), (1562.0, 100.0)])}
 input_file_list = [
+        "rtsp://admin:total!23@192.168.0.203:554",
         "rtsp://admin:total!23@192.168.0.201:554",
-        "rtsp://admin:total!23@192.168.0.202:554",
-        "rtsp://admin:total!23@192.168.0.205:554/trackID=1",
-        "rtsp://admin:total!23@192.168.0.201:554",
-        "rtsp://admin:total!23@192.168.0.202:554",
-        "rtsp://admin:total!23@192.168.0.205:554/trackID=1",
-        "rtsp://admin:total!23@192.168.0.201:554",
-        "rtsp://admin:total!23@192.168.0.202:554",
-        "rtsp://admin:total!23@192.168.0.205:554/trackID=1",
-        "rtsp://admin:total!23@192.168.0.201:554",
-        "rtsp://admin:total!23@192.168.0.202:554",
-        "rtsp://admin:total!23@192.168.0.205:554/trackID=1",
+        # "rtsp://admin:total!23@192.168.0.205:554/trackID=1",
 ]
 
 
@@ -163,14 +156,15 @@ def create_record_bin(cam_idx: int, output_path: str) -> Gst.Bin:
 
 def start_event(ctx: PipelineContext, cam_idx, event_id, object_id):
 
-    cur_time = datetime.now(timezone.utc).isoformat()
-    print(f"[{cur_time}][START] cam{cam_idx} cam{cam_idx} event{event_id}")
+    cur_time = datetime.now(timezone.utc)
+    two_seconds_ago = cur_time - timedelta(seconds=2)
+    print(f"[{two_seconds_ago.isoformat()}][START] cam{cam_idx} cam{cam_idx} event{event_id}")
 
     ctx.zmq_socket.send_json({
         "objectId": str(object_id),
         # "cameraId": str(cam_idx), # Integration Test
         "cameraId": '1', # Unit Test
-        "timestamp": cur_time,
+        "timestamp": two_seconds_ago.isoformat(),
         "action": "START",
         "eventType": EVENT_CLASS[event_id],
     })
@@ -357,6 +351,17 @@ def conv_src_pad_buffer_probe(pad, info, ctx):
     return Gst.PadProbeReturn.OK
 
 
+def handle_force_stop(ctx: PipelineContext):
+    print("system call all recoding stop start")
+
+    for key, tracker in list(ctx.object_tracker.items()):
+        if tracker.get("is_recording", False):
+            cam_idx, event_id, object_id = key
+            stop_event(ctx, cam_idx, event_id, object_id)
+
+    print("system call all recoding stop finish")
+
+
 def main():
     context = zmq.Context()
     zmq_socket = context.socket(zmq.PUB)
@@ -488,7 +493,16 @@ def main():
     loop = GLib.MainLoop() # Create a mainloop
     bus = pipeline.get_bus() # Retrieve the bus from the pipeline
     bus.add_signal_watch() # Add a watch for new messages on the bus
-    bus.connect ("message", bus_call, loop) # Connect the loop to the callback function
+#    bus.connect ("message", bus_call, loop) # Connect the loop to the callback function
+    bus.connect ("message", lambda bus, msg: bus_call(bus, msg, loop, ctx, handle_force_stop))
+
+    def signal_handler(sig, frame):
+        handle_force_stop(ctx)
+        pipeline.set_state(Gst.State.NULL)
+        sys.exit(0)
+
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
 
     print("Starting pipeline \n")
     pipeline.set_state(Gst.State.PLAYING)
@@ -497,11 +511,17 @@ def main():
 
     try:
         loop.run()
-    except:
-        pass
+    except KeyboardInterrupt:
+        print("[INFO] KeyboardInterrupt")
+        handle_force_stop(ctx)
     finally:
         print("[INFO] Stopping pipeline...")
         pipeline.set_state(Gst.State.NULL)
 
 if __name__ == '__main__':
+    
+    # with open("source_config.json", "r", encoding='utf-8') as f:
+    #     cameras = json.load(f)
+
+
     main()
